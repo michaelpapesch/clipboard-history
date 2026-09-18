@@ -150,9 +150,19 @@ from that folder.
 
 ### Note on MinGW builds
 
-With MinGW the executable depends on `libwinpthread-1.dll`. The build copies it next to the exe
-automatically; if you move the exe somewhere else (for example before enabling *Start with
-Windows*), move the DLL along with it. MSVC builds have no such dependency.
+The executable is linked statically (`-static`), so `clipboard_history.exe` is a single standalone
+file: it needs no MinGW runtime DLLs and only imports libraries that ship with Windows. Copy it
+wherever you like.
+
+CLion's bundled MinGW needs two linker fixups for that, because its static `libwinpthread` was
+built against UCRT while the toolchain defaults to `msvcrt`. `CMakeLists.txt` probes for this at
+configure time (`STATIC_LINK_WORKS` / `STATIC_LINK_WORKS_WITH_FIXUPS`) and only adds the fixups
+where a plain `-static` link fails, so other MinGW-w64 distributions (MSYS2, WinLibs, llvm-mingw)
+are not affected. If neither variant links, CMake prints a warning and falls back to a build that
+needs `libwinpthread-1.dll` next to the exe.
+
+To check the result: `objdump -p build\clipboard_history.exe | findstr "DLL Name"` should list
+only Windows system DLLs.
 
 ## Project layout
 
