@@ -4,6 +4,8 @@ A small Windows tray tool that remembers the last 30 texts you copied. Pressing 
 list of them instead of pasting right away, so you can pick an older entry — or just hit Enter to
 paste the latest one as usual.
 
+![The clipboard history popup listing recently copied texts](docs/screenshot.png)
+
 - Small native Win32 executable (C++20), no installer, no frameworks
 - The popup never takes focus, so the application you paste into keeps its caret and selection
 - History is stored encrypted on disk
