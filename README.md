@@ -77,25 +77,39 @@ Open the folder and build/run the `clipboard_history` target.
 
 ### Command line
 
+With `cmake` and a MinGW-w64 `bin` folder (`g++`, `mingw32-make`) on the `PATH`:
+
 ```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
 The executable ends up in `build\clipboard_history.exe`.
 
+If you have Ninja on the `PATH` as well, `-G Ninja` works the same way and builds a little faster.
+Without it, `-G Ninja` fails with *"unable to find a build program corresponding to Ninja"* — use
+the MinGW Makefiles generator above instead. With MSVC, run the commands from a *Developer
+PowerShell for VS* and leave out `-G` to get the default Visual Studio generator (the exe then
+lands in `build\Release\`, and `--config Release` goes on the build command instead of
+`CMAKE_BUILD_TYPE`).
+
 `CMakeLists.txt` asks for CMake 4.3 because that is what CLion generated; nothing in it needs a
 recent version, so lower `cmake_minimum_required` if your CMake is older.
 
-To use CLion's bundled toolchain outside the IDE, put its MinGW on the `PATH` first and call its
-CMake (adjust the version in the path):
+#### Using CLion's bundled toolchain
+
+No separate compiler is needed if CLion is installed: it ships MinGW, Ninja and CMake. Put them on
+the `PATH` for the current session (adjust the version in the path) and build as above:
 
 ```powershell
 $clion = "C:\Program Files\JetBrains\CLion 2025.3.3\bin"
-$env:PATH = "$clion\mingw\bin;$clion\ninja\win\x64;$env:PATH"
-& "$clion\cmake\win\x64\bin\cmake.exe" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-& "$clion\cmake\win\x64\bin\cmake.exe" --build build
+$env:PATH = "$clion\mingw\bin;$clion\ninja\win\x64;$clion\cmake\win\x64\bin;$env:PATH"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
+
+A standalone CMake install works just as well with CLion's MinGW; only the compiler has to come
+from that folder.
 
 ### Note on MinGW builds
 
