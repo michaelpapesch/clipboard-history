@@ -10,16 +10,34 @@ if (MSVC)
     target_sources(clipboard_history PRIVATE app.manifest)
 else ()
     target_sources(clipboard_history PRIVATE app.rc)
-    target_link_options(clipboard_history PRIVATE -static-libgcc -static-libstdc++)
 
-    # CLion's bundled MinGW can't link winpthread statically (its static lib targets UCRT, the
-    # toolchain defaults to msvcrt), so ship the DLL next to the exe instead.
-    get_filename_component(compiler_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    find_file(WINPTHREAD_DLL libwinpthread-1.dll HINTS "${compiler_dir}" NO_DEFAULT_PATH)
-    if (WINPTHREAD_DLL)
-        add_custom_command(TARGET clipboard_history POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${WINPTHREAD_DLL}" "$<TARGET_FILE_DIR:clipboard_history>")
+    # Link the runtime statically so the exe runs on its own. With the posix thread model libstdc++
+    # pulls in winpthread, and CLion's bundled MinGW ships a static winpthread that was built
+    # against UCRT while the toolchain defaults to msvcrt. That leaves two symbols unresolved:
+    #   __intrinsic_setjmpex  UCRT's name for msvcrt's _setjmpex, so alias it
+    #   __ms_vsnprintf        lives in libmingwex, which is scanned before libmsvcrt asks for it,
+    #                         so pull it in up front
+    # Only apply the fixups where a plain -static link fails.
+    include(CheckCXXSourceCompiles)
+    set(static_probe "#include <string>
+        int main(int argc, char **) { static std::string s(argc, 'x'); return (int) s.size(); }")
+    set(static_fixups -Wl,--defsym,__intrinsic_setjmpex=_setjmpex -Wl,-u,__ms_vsnprintf)
+
+    set(CMAKE_REQUIRED_LINK_OPTIONS -static)
+    check_cxx_source_compiles("${static_probe}" STATIC_LINK_WORKS)
+    if (NOT STATIC_LINK_WORKS)
+        set(CMAKE_REQUIRED_LINK_OPTIONS -static ${static_fixups})
+        check_cxx_source_compiles("${static_probe}" STATIC_LINK_WORKS_WITH_FIXUPS)
+    endif ()
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+
+    if (STATIC_LINK_WORKS)
+        target_link_options(clipboard_history PRIVATE -static)
+    elseif (STATIC_LINK_WORKS_WITH_FIXUPS)
+        target_link_options(clipboard_history PRIVATE -static ${static_fixups})
+    else ()
+        message(WARNING "Static link failed; clipboard_history.exe will need libwinpthread-1.dll")
+        target_link_options(clipboard_history PRIVATE -static-libgcc -static-libstdc++)
     endif ()
 endif ()
 
