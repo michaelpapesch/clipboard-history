@@ -67,6 +67,43 @@ manage, and the file is unreadable for other users or when copied to another mac
 
 Only text is stored, at most 30 entries, each up to 256K characters.
 
+## No Microsoft account needed
+
+The tool works entirely offline and with a plain local Windows account. There is no sign-in, no
+cloud sync and no telemetry — it contains no networking code at all, and links against nothing but
+the basic Windows system libraries (`user32`, `gdi32`, `shell32`, `advapi32`, `crypt32`, `dwmapi`,
+`uxtheme`, `shcore`). What you copy never leaves the machine.
+
+### Compared to Windows' built-in clipboard history (Win+V)
+
+Windows 10 and 11 ship their own clipboard history. Its local list also works with a local
+account, but everything beyond that is built around a Microsoft account, and it forgets the list
+on every restart:
+
+|                          | This tool                                   | Windows clipboard history (Win+V)                          |
+|--------------------------|---------------------------------------------|------------------------------------------------------------|
+| Microsoft account        | Never used                                  | Not needed for the local list; *Sync across devices* requires a Microsoft (or work) account |
+| Where the data goes      | Stays on the machine, no networking code    | Local only while sync is off; with sync on, copied text is uploaded to Microsoft's cloud |
+| After a restart          | History is still there (encrypted on disk)  | List is cleared, except for pinned items                   |
+| Entries                  | 30                                          | 25                                                         |
+| Content                  | Text only                                   | Text, HTML and images (up to 4 MB each)                    |
+| Pinning entries          | No                                          | Yes                                                        |
+| Shortcut                 | **Ctrl+V** – the key you already press      | **Win+V**, a separate shortcut next to the normal paste    |
+| Setup                    | Start the exe                               | Enable under *Settings → System → Clipboard*               |
+
+So if all you want is a local list, Win+V does not force you into a Microsoft account either — the
+difference is that this tool has no account-bound features to begin with, keeps the history across
+restarts, and sits on the normal paste shortcut.
+
+- It does not use or depend on the Windows clipboard history or its sync feature. Both can stay
+  switched off under *Settings → System → Clipboard*; the two can also run side by side, since
+  they use different shortcuts.
+- The encryption of the history file (DPAPI) is tied to your Windows user profile, not to an online
+  account, so it works the same for local, Microsoft and domain accounts.
+- One thing to know with local accounts: if an administrator *resets* your password (as opposed to
+  you changing it yourself), Windows can no longer decrypt DPAPI-protected data, and the saved
+  history is lost. The tool then simply starts with an empty list.
+
 ## Building
 
 Requirements: Windows 10 or later, CMake, and a C++20 compiler (MinGW-w64 or MSVC).
