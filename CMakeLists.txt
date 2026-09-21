@@ -1,15 +1,21 @@
 cmake_minimum_required(VERSION 4.3)
-project(clipboard_history)
+# The one place the version lives (semantic versioning, see README). Releases are tagged vX.Y.Z.
+project(clipboard_history VERSION 1.1.1)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(clipboard_history WIN32 main.cpp)
+# app.rc holds the version resource (and, for MinGW, the manifest).
+add_executable(clipboard_history WIN32 main.cpp app.rc)
 
-# MSVC embeds a .manifest source itself; MinGW needs it wrapped in a resource script.
+# version.h hands the version to main.cpp and app.rc.
+configure_file(version.h.in version.h @ONLY)
+target_include_directories(clipboard_history PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# MSVC embeds a .manifest source itself; MinGW needs it wrapped in the resource script.
 if (MSVC)
     target_sources(clipboard_history PRIVATE app.manifest)
+    target_compile_definitions(clipboard_history PRIVATE APP_MANIFEST_BY_LINKER)
 else ()
-    target_sources(clipboard_history PRIVATE app.rc)
 
     # Link the runtime statically so the exe runs on its own. With the posix thread model libstdc++
     # pulls in winpthread, and CLion's bundled MinGW ships a static winpthread that was built

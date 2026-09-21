@@ -51,7 +51,7 @@ the picture of them that the spreadsheet adds.
 
 - **Left click** – open the list in copy-only mode (the chosen entry is put on the clipboard, not
   pasted)
-- **Right click** – menu:
+- **Right click** – menu, headed by the version of the tool:
   - **Open history**
   - **Pause (Ctrl+V pastes normally)** – stops recording and leaves Ctrl+V alone; useful in
     programs where Ctrl+V means something other than paste
@@ -196,11 +196,28 @@ needs `libwinpthread-1.dll` next to the exe.
 To check the result: `objdump -p build\clipboard_history.exe | findstr "DLL Name"` should list
 only Windows system DLLs.
 
+## Versioning
+
+The project follows [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`), applied to
+what a user of the tool can rely on:
+
+- **MAJOR** – an incompatible change: a saved history that can no longer be read, a removed
+  feature, a changed shortcut
+- **MINOR** – new features; an existing `history.dat` keeps working
+- **PATCH** – bug fixes only
+
+The version is set in one place, `project(clipboard_history VERSION x.y.z)` in `CMakeLists.txt`.
+From there it goes into the exe's version resource (Explorer: *Properties → Details*), the tray
+icon's tooltip and the first line of its menu. Releases are tagged `vX.Y.Z` in git; what changed is
+listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Project layout
 
 | File             | Purpose                                                        |
 |------------------|----------------------------------------------------------------|
 | `main.cpp`       | The whole application                                          |
 | `app.manifest`   | Common-controls v6 and per-monitor DPI awareness               |
-| `app.rc`         | Embeds the manifest for MinGW builds (MSVC embeds it directly) |
-| `CMakeLists.txt` | Build script                                                   |
+| `app.rc`         | Version resource; embeds the manifest for MinGW builds (MSVC embeds it directly) |
+| `version.h.in`   | Template for `version.h`, which CMake fills with the project version |
+| `CMakeLists.txt` | Build script; holds the version number                         |
+| `CHANGELOG.md`   | Changes per version                                            |

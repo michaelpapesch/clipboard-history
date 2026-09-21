@@ -1,2 +1,35 @@
-// 24 = RT_MANIFEST
+#include <winver.h>
+#include "version.h"
+
+// MSVC embeds app.manifest itself; MinGW needs it as a resource. 24 = RT_MANIFEST
+#ifndef APP_MANIFEST_BY_LINKER
 1 24 "app.manifest"
+#endif
+
+// Shown by Explorer under Properties > Details.
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+PRODUCTVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0" // US English, Unicode
+        BEGIN
+            VALUE "FileDescription", "Clipboard History"
+            VALUE "FileVersion", APP_VERSION_STRING
+            VALUE "InternalName", "clipboard_history"
+            VALUE "OriginalFilename", "clipboard_history.exe"
+            VALUE "ProductName", "Clipboard History"
+            VALUE "ProductVersion", APP_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
