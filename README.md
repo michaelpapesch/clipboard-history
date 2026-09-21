@@ -1,20 +1,20 @@
 # Clipboard History
 
-A small Windows tray tool that remembers the last 30 texts you copied. Pressing **Ctrl+V** opens a
-list of them instead of pasting right away, so you can pick an older entry — or just hit Enter to
-paste the latest one as usual.
+A small Windows tray tool that remembers the last 50 things you copied — texts, files and images.
+Pressing **Ctrl+V** opens a list of them instead of pasting right away, so you can pick an older
+entry — or just hit Enter to paste the latest one as usual.
 
-![The clipboard history popup listing recently copied texts](docs/screenshot.png)
+![The clipboard history popup listing recently copied texts, an image and files](docs/screenshot.png)
 
 - Small native Win32 executable (C++20), no installer, no frameworks
 - The popup never takes focus, so the application you paste into keeps its caret and selection
-- History is stored encrypted on disk
+- History is kept encrypted, in memory as well as on disk
 - Follows the Windows light/dark theme and is per-monitor DPI aware
 
 ## Usage
 
-Start `clipboard_history.exe`. It lives in the notification area (tray) and records every text you
-copy.
+Start `clipboard_history.exe`. It lives in the notification area (tray) and records the texts,
+files and images you copy.
 
 ### The popup
 
@@ -32,7 +32,20 @@ the application doesn't expose one) with the most recent entry selected.
 | `Esc`, any other key, click outside | Close the popup                    |
 
 A pasted entry moves to the top of the list. Removing the top entry (or clearing the list) also
-removes that text from the Windows clipboard, so a deleted item is really gone.
+removes that content from the Windows clipboard, so a deleted item is really gone.
+
+Besides text, the list shows
+
+- **files and folders** copied in Explorer (or any other program that puts files on the clipboard),
+  with their names and folder. Only the paths are remembered, not the file contents: pasting copies
+  the files as they are at that moment, and files that no longer exist are left out. Files that
+  were *cut* are pasted as a copy, too.
+- **images** (screenshots, *Copy image* in a browser, a selection in a paint program, …) with a
+  thumbnail and their size in pixels.
+
+Text is pasted as plain text. If a program puts several formats on the clipboard, files win over
+text and text wins over an image — so cells copied from a spreadsheet are recorded as text, not as
+the picture of them that the spreadsheet adds.
 
 ### Tray icon
 
@@ -44,6 +57,8 @@ removes that text from the Windows clipboard, so a deleted item is really gone.
     programs where Ctrl+V means something other than paste
   - **Start with Windows** – adds/removes an entry under
     `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  - **Show image thumbnails** – on by default; switch it off to list images by their size only,
+    e.g. when other people can see your screen
   - **Clear history**
   - **Exit**
 
@@ -51,7 +66,8 @@ removes that text from the Windows clipboard, so a deleted item is really gone.
 
 The list is skipped and Ctrl+V behaves as usual when
 
-- the clipboard holds something that is not text (images, files, …),
+- the clipboard holds something the tool does not record (neither text, files nor an image; an
+  image of more than 64 MB; more than 256K characters of text),
 - the clipboard content was marked as secret by a password manager
   (`ExcludeClipboardContentFromMonitorProcessing` / `CanIncludeInClipboardHistory`) — such content
   is never recorded,
@@ -67,7 +83,21 @@ The history is saved to `%APPDATA%\ClipboardHistory\history.dat`. The file is en
 Windows Data Protection API (DPAPI), which ties it to your Windows user account: no password to
 manage, and the file is unreadable for other users or when copied to another machine.
 
-Only text is stored, at most 30 entries, each up to 256K characters.
+Texts and file lists are saved, each up to 256K characters. **Images are kept in memory only** and
+are gone after a restart of the tool: a single one may take up to 64 MB (uncompressed, which is
+how Windows hands them out — a 4K screenshot is about 33 MB), all of them together up to 256 MB;
+beyond that the oldest images are dropped. The list holds at most 50 entries.
+
+While the tool runs, the entries are not kept as plain data in memory either: every text, file
+list, image and thumbnail is encrypted with `CryptProtectMemory` and only decrypted for the moment
+it is drawn, pasted or saved, after which the plain copy is wiped. The key is held by the Windows
+kernel, so reading the process memory, a crash dump, the pagefile or the hibernation file yields
+only ciphertext.
+
+This raises the bar, it is not a sandbox: Windows gives every program in your session access to
+the *current* clipboard content, and a malicious program running under your account could also
+inject code into the tool. Against other users and against someone who gets hold of the disk or
+the file, the history is safe.
 
 ## No Microsoft account needed
 
@@ -86,9 +116,9 @@ on every restart:
 |--------------------------|---------------------------------------------|------------------------------------------------------------|
 | Microsoft account        | Never used                                  | Not needed for the local list; *Sync across devices* requires a Microsoft (or work) account |
 | Where the data goes      | Stays on the machine, no networking code    | Local only while sync is off; with sync on, copied text is uploaded to Microsoft's cloud |
-| After a restart          | History is still there (encrypted on disk)  | List is cleared, except for pinned items                   |
-| Entries                  | 30                                          | 25                                                         |
-| Content                  | Text only                                   | Text, HTML and images (up to 4 MB each)                    |
+| After a restart          | Texts and files are still there (encrypted on disk), images are not | List is cleared, except for pinned items |
+| Entries                  | 50                                          | 25                                                         |
+| Content                  | Text, files and images (up to 64 MB each)   | Text, HTML and images (up to 4 MB each); no files          |
 | Pinning entries          | No                                          | Yes                                                        |
 | Shortcut                 | **Ctrl+V** – the key you already press      | **Win+V**, a separate shortcut next to the normal paste    |
 | Setup                    | Start the exe                               | Enable under *Settings → System → Clipboard*               |

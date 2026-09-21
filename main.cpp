@@ -1,4 +1,4 @@
-// Clipboard History - a small tray tool that remembers the last copied texts.
+// Clipboard History - a small tray tool that remembers the last copied texts, files and images.
 //
 // Ctrl+V opens a list of the recent clipboard entries instead of pasting right away:
 //   Enter / Ctrl+V again   paste the selected entry (initially the latest one)
@@ -9,11 +9,12 @@
 //
 // The popup never takes focus, so the application being pasted into keeps its caret. Keys are
 // routed to the popup by a low-level keyboard hook while it is visible. If the clipboard holds
-// something that is not in the history (image, files, a password-manager secret), Ctrl+V is left
-// alone and pastes normally.
+// something that is not in the history (a password-manager secret, an oversized image), Ctrl+V
+// is left alone and pastes normally.
 
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <string>
@@ -32,9 +34,14 @@ constexpr wchar_t kAppName[] = L"Clipboard History";
 constexpr wchar_t kClassName[] = L"ClipboardHistoryWnd";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"ClipboardHistory";
+constexpr wchar_t kSettingsKey[] = L"Software\\ClipboardHistory";
+constexpr wchar_t kThumbnailsValue[] = L"ShowThumbnails";
 
-constexpr size_t kMaxEntries = 30;
-constexpr size_t kMaxEntryChars = 256 * 1024;
+constexpr size_t kMaxEntries = 50;
+constexpr size_t kMaxEntryChars = 256 * 1024;          // text and file lists
+constexpr size_t kMaxImageBytes = 64u * 1024 * 1024;   // one image, as uncompressed DIB
+constexpr size_t kMaxImagesTotal = 256u * 1024 * 1024; // all images; the oldest ones are dropped
+constexpr int kThumbWidth = 288, kThumbHeight = 96;
 constexpr int kVisibleRows = 6;
 
 constexpr UINT WM_TRAY = WM_APP + 1;
@@ -43,7 +50,7 @@ constexpr UINT WM_ACTION = WM_APP + 3;     // posted by the hooks; wParam = Acti
 
 enum Action { ACT_SHOW, ACT_PASTE, ACT_HIDE, ACT_DELETE, ACT_NAV };
 enum { IDC_LIST = 100 };
-enum { IDM_OPEN = 200, IDM_PAUSE, IDM_AUTOSTART, IDM_CLEAR, IDM_EXIT };
+enum { IDM_OPEN = 200, IDM_PAUSE, IDM_AUTOSTART, IDM_THUMBNAILS, IDM_CLEAR, IDM_EXIT };
 enum { TIMER_SAVE = 1 };
 
 struct Theme {
@@ -69,11 +76,66 @@ bool g_swallowed[256];               // keys whose key-down the hook has eaten
 bool g_pasteOnSelect;                // false when opened from the tray: only copy
 bool g_passThrough = true;           // clipboard content is not the top history entry
 bool g_paused;
+bool g_showThumbnails = true;        // off: images are listed by their size only
 bool g_dirty;
 
-std::vector<std::wstring> g_history; // newest first; list row == index
+enum Kind : uint32_t { KIND_TEXT, KIND_FILES, KIND_IMAGE }; // values are part of the file format
+
+// A piece of history data as it is kept in RAM: encrypted with CryptProtectMemory, whose key lives
+// in the kernel, so memory scrapers, crash dumps and the pagefile only ever see ciphertext.
+struct Blob {
+    std::vector<BYTE> data; // zero-padded to CRYPTPROTECTMEMORY_BLOCK_SIZE
+    size_t size = 0;        // bytes without the padding
+    bool encrypted = false; // false only if CryptProtectMemory failed; data is then plain
+};
+
+struct Entry {
+    Kind kind = KIND_TEXT;
+    Blob body;        // text: UTF-16; files: UTF-16 paths separated by '\n'; image: packed DIB (CF_DIB)
+    Blob thumb;       // image: small 32-bit DIB for the list
+    SIZE pixels{};    // image: dimensions
+    uint32_t tag = 0; // image: sampled checksum, finds duplicates without decrypting every image
+};
+
+std::vector<Entry> g_history; // newest first; list row == index
 
 int S(int v) { return MulDiv(v, static_cast<int>(g_dpi), 96); }
+
+// ------------------------------------------------------------- in-memory protection
+
+// Plain content exists only in short-lived std::wstring / std::vector<BYTE> buffers that are wiped
+// after use.
+template <class C> void Wipe(C &c) {
+    SecureZeroMemory(c.data(), c.size() * sizeof(c[0]));
+    c.clear();
+}
+
+// Wipes its argument.
+template <class C> Blob Seal(C &plain) {
+    Blob b;
+    b.size = plain.size() * sizeof(plain[0]);
+    size_t block = CRYPTPROTECTMEMORY_BLOCK_SIZE;
+    b.data.resize((b.size + block - 1) / block * block);
+    memcpy(b.data.data(), plain.data(), b.size);
+    Wipe(plain);
+    b.encrypted = b.data.empty() ||
+                  CryptProtectMemory(b.data.data(), static_cast<DWORD>(b.data.size()), CRYPTPROTECTMEMORY_SAME_PROCESS);
+    return b;
+}
+
+// The caller wipes the result. Empty if decryption fails.
+template <class C> C Unseal(const Blob &b) {
+    using T = typename C::value_type;
+    C plain(b.data.size() / sizeof(T), T{}); // the padded size is a multiple of sizeof(T)
+    memcpy(plain.data(), b.data.data(), b.data.size());
+    if (b.encrypted && !plain.empty() &&
+        !CryptUnprotectMemory(plain.data(), static_cast<DWORD>(b.data.size()), CRYPTPROTECTMEMORY_SAME_PROCESS)) {
+        Wipe(plain);
+        return plain;
+    }
+    plain.resize(b.size / sizeof(T)); // drops the padding, never reallocates
+    return plain;
+}
 
 // ---------------------------------------------------------------- storage
 
@@ -92,7 +154,8 @@ DATA_BLOB Entropy() {
 }
 
 // The file is a DPAPI blob (decryptable only by this Windows user). Plain layout:
-// "CLPH", u32 version, u32 count, then per entry u32 length + UTF-16 chars.
+// "CLPH", u32 version, u32 count, then per entry u32 kind + u32 length + UTF-16 chars.
+// (Version 1 had no kind; everything was text.) Images are not saved: they stay in RAM only.
 void SaveHistory() {
     g_dirty = false;
     std::wstring path = DataFile();
@@ -103,13 +166,26 @@ void SaveHistory() {
         auto *p = static_cast<const BYTE *>(data);
         plain.insert(plain.end(), p, p + bytes);
     };
-    uint32_t header[2] = {1, static_cast<uint32_t>(g_history.size())};
+    // Reserved up front: a growing vector would leave unwiped plain text behind in freed blocks.
+    size_t total = 12;
+    uint32_t count = 0;
+    for (const auto &entry : g_history) {
+        if (entry.kind == KIND_IMAGE) continue;
+        total += 2 * sizeof(uint32_t) + entry.body.size;
+        ++count;
+    }
+    plain.reserve(total);
+
+    uint32_t header[2] = {2, count};
     append("CLPH", 4);
     append(header, sizeof(header));
     for (const auto &entry : g_history) {
-        uint32_t len = static_cast<uint32_t>(entry.size());
-        append(&len, sizeof(len));
-        append(entry.data(), len * sizeof(wchar_t));
+        if (entry.kind == KIND_IMAGE) continue;
+        std::wstring text = Unseal<std::wstring>(entry.body);
+        uint32_t fields[2] = {entry.kind, static_cast<uint32_t>(text.size())};
+        append(fields, sizeof(fields));
+        append(text.data(), text.size() * sizeof(wchar_t));
+        Wipe(text);
     }
 
     DATA_BLOB in = {static_cast<DWORD>(plain.size()), plain.data()}, entropy = Entropy(), out{};
@@ -142,14 +218,19 @@ void ParseHistory(const BYTE *data, size_t size) {
         return true;
     };
     uint32_t version = 0, count = 0;
-    if (!readU32(version) || version != 1 || !readU32(count)) return;
+    if (!readU32(version) || version < 1 || version > 2 || !readU32(count)) return;
     for (uint32_t i = 0; i < count && g_history.size() < kMaxEntries; ++i) {
-        uint32_t len = 0;
+        uint32_t kind = KIND_TEXT, len = 0;
+        if (version >= 2 && (!readU32(kind) || kind > KIND_FILES)) return;
         if (!readU32(len) || len > kMaxEntryChars || size - pos < len * sizeof(wchar_t)) return;
-        std::wstring entry(len, L'\0');
-        memcpy(entry.data(), data + pos, len * sizeof(wchar_t));
+        std::wstring text(len, L'\0');
+        memcpy(text.data(), data + pos, len * sizeof(wchar_t));
         pos += len * sizeof(wchar_t);
-        if (!entry.empty()) g_history.push_back(std::move(entry));
+        if (text.empty()) continue;
+        Entry entry;
+        entry.kind = static_cast<Kind>(kind);
+        entry.body = Seal(text);
+        g_history.push_back(std::move(entry));
     }
 }
 
@@ -190,6 +271,7 @@ void HidePopup();
 // Single-line-friendly version of an entry: whitespace runs collapsed, length capped.
 std::wstring Preview(const std::wstring &s) {
     std::wstring out;
+    out.reserve(302); // never reallocates, so the caller's Wipe covers every copy
     bool space = false;
     for (wchar_t c : s) {
         if (out.size() >= 300) break;
@@ -212,26 +294,110 @@ bool OpenClipboardRetry() {
     return false;
 }
 
-// Returns false if the text is not something we keep (empty, blank, huge).
-bool AddEntry(std::wstring text) {
-    if (text.size() > kMaxEntryChars || Preview(text).empty()) return false;
-    auto it = std::find(g_history.begin(), g_history.end(), text);
-    if (it == g_history.begin() && it != g_history.end()) return true;
-    if (it != g_history.end()) g_history.erase(it);
-    g_history.insert(g_history.begin(), std::move(text));
+// Keeps the entry count and the memory used by images within their limits; the top entry stays.
+void TrimHistory() {
     if (g_history.size() > kMaxEntries) g_history.resize(kMaxEntries);
-    ScheduleSave();
-    if (IsWindowVisible(g_hwnd)) RefreshPopup();
-    return true;
+    size_t images = 0;
+    for (const auto &e : g_history)
+        if (e.kind == KIND_IMAGE) images += e.body.size;
+    for (size_t i = g_history.size(); i-- > 1 && images > kMaxImagesTotal;) {
+        if (g_history[i].kind != KIND_IMAGE) continue;
+        images -= g_history[i].body.size;
+        g_history.erase(g_history.begin() + i);
+    }
 }
 
-// Returns true if the clipboard text is now the top history entry.
+// Puts the content on top of the history; an identical older entry is moved up instead. entry
+// carries everything but the body. Wipes plain.
+template <class C> void AddEntry(Entry entry, C &plain) {
+    size_t bytes = plain.size() * sizeof(plain[0]);
+    auto it = std::find_if(g_history.begin(), g_history.end(), [&](const Entry &e) {
+        if (e.kind != entry.kind || e.body.size != bytes || e.tag != entry.tag) return false;
+        C other = Unseal<C>(e.body);
+        bool same = other == plain;
+        Wipe(other);
+        return same;
+    });
+    bool isTop = it == g_history.begin() && it != g_history.end();
+    if (it == g_history.end()) {
+        entry.body = Seal(plain);
+        g_history.insert(g_history.begin(), std::move(entry));
+    } else {
+        std::rotate(g_history.begin(), it, it + 1); // move to the top
+    }
+    Wipe(plain);
+    if (isTop) return;
+    TrimHistory();
+    ScheduleSave();
+    if (IsWindowVisible(g_hwnd)) RefreshPopup();
+}
+
+// Offset of the pixels in a packed DIB; 0 unless it is an uncompressed bitmap that fits into size.
+size_t DibPixelOffset(const BYTE *dib, size_t size) {
+    BITMAPINFOHEADER h;
+    if (size < sizeof(h)) return 0;
+    memcpy(&h, dib, sizeof(h));
+    if (h.biSize < sizeof(h) || h.biWidth <= 0 || h.biHeight == 0 || h.biHeight == LONG_MIN || h.biPlanes != 1 ||
+        h.biClrUsed > 256 || (h.biCompression != BI_RGB && h.biCompression != BI_BITFIELDS))
+        return 0;
+    if (h.biBitCount != 1 && h.biBitCount != 4 && h.biBitCount != 8 && h.biBitCount != 16 && h.biBitCount != 24 &&
+        h.biBitCount != 32)
+        return 0;
+    size_t colors = h.biClrUsed ? h.biClrUsed : h.biBitCount <= 8 ? size_t{1} << h.biBitCount : 0;
+    size_t offset = h.biSize + colors * sizeof(RGBQUAD);
+    if (h.biSize == sizeof(h) && h.biCompression == BI_BITFIELDS) offset += 3 * sizeof(DWORD);
+    size_t stride = (static_cast<size_t>(h.biWidth) * h.biBitCount + 31) / 32 * 4;
+    size_t rows = static_cast<size_t>(std::abs(h.biHeight));
+    if (offset >= size || stride > (size - offset) / rows) return 0;
+    return offset;
+}
+
+// Small top-down 32-bit DIB of the image for the list. The caller wipes the result.
+std::vector<BYTE> MakeThumbnail(const std::vector<BYTE> &dib, size_t pixelOffset) {
+    auto *info = reinterpret_cast<const BITMAPINFO *>(dib.data());
+    int w = info->bmiHeader.biWidth, h = std::abs(info->bmiHeader.biHeight);
+    double scale = std::min({1.0, static_cast<double>(kThumbWidth) / w, static_cast<double>(kThumbHeight) / h});
+    int tw = std::max(1, static_cast<int>(w * scale)), th = std::max(1, static_cast<int>(h * scale));
+
+    BITMAPINFOHEADER head{};
+    head.biSize = sizeof(head);
+    head.biWidth = tw;
+    head.biHeight = -th;
+    head.biPlanes = 1;
+    head.biBitCount = 32;
+
+    std::vector<BYTE> out;
+    void *bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (HBITMAP bmp = CreateDIBSection(dc, reinterpret_cast<const BITMAPINFO *>(&head), DIB_RGB_COLORS, &bits,
+                                       nullptr, 0)) {
+        HGDIOBJ old = SelectObject(dc, bmp);
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchDIBits(dc, 0, 0, tw, th, 0, 0, w, h, dib.data() + pixelOffset, info, DIB_RGB_COLORS, SRCCOPY);
+        GdiFlush();
+        size_t bytes = static_cast<size_t>(tw) * th * 4;
+        out.resize(sizeof(head) + bytes);
+        memcpy(out.data(), &head, sizeof(head));
+        memcpy(out.data() + sizeof(head), bits, bytes);
+        SecureZeroMemory(bits, bytes);
+        SelectObject(dc, old);
+        DeleteObject(bmp);
+    }
+    DeleteDC(dc);
+    return out;
+}
+
+// Returns true if the clipboard content is now the top history entry.
 bool CaptureClipboard() {
     // Password managers mark secrets with these formats; respect them.
     static const UINT fmtExclude = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
     static const UINT fmtCanInclude = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
 
-    if (IsClipboardFormatAvailable(fmtExclude) || !IsClipboardFormatAvailable(CF_UNICODETEXT)) return false;
+    if (IsClipboardFormatAvailable(fmtExclude)) return false;
+    if (!IsClipboardFormatAvailable(CF_HDROP) && !IsClipboardFormatAvailable(CF_UNICODETEXT) &&
+        !IsClipboardFormatAvailable(CF_DIB))
+        return false;
     if (!OpenClipboardRetry()) return false;
 
     bool allowed = true;
@@ -244,37 +410,160 @@ bool CaptureClipboard() {
         }
     }
 
+    // Files win over text (file managers may add the paths as text), text wins over images
+    // (spreadsheets and word processors add a picture of the copied text).
+    Entry entry;
     std::wstring text;
-    if (allowed) {
-        if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
-            if (auto *p = static_cast<const wchar_t *>(GlobalLock(h))) {
-                size_t maxChars = GlobalSize(h) / sizeof(wchar_t);
-                text.assign(p, wcsnlen(p, maxChars));
+    std::vector<BYTE> image;
+    if (!allowed) {
+    } else if (HANDLE h = GetClipboardData(CF_HDROP)) {
+        entry.kind = KIND_FILES;
+        auto drop = static_cast<HDROP>(h);
+        UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        size_t total = 0;
+        for (UINT i = 0; i < count; ++i) total += DragQueryFileW(drop, i, nullptr, 0) + 1;
+        text.reserve(total); // no reallocation, so the final Wipe covers every copy
+        for (UINT i = 0; i < count; ++i) {
+            if (i) text += L'\n';
+            size_t at = text.size();
+            UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            text.resize(at + len);
+            DragQueryFileW(drop, i, text.data() + at, len + 1);
+        }
+    } else if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (auto *p = static_cast<const wchar_t *>(GlobalLock(h))) {
+            size_t maxChars = GlobalSize(h) / sizeof(wchar_t);
+            text.assign(p, wcsnlen(p, maxChars));
+            GlobalUnlock(h);
+        }
+    } else if (HANDLE h = GetClipboardData(CF_DIB)) {
+        entry.kind = KIND_IMAGE;
+        size_t size = GlobalSize(h);
+        if (size <= kMaxImageBytes) {
+            if (auto *p = static_cast<const BYTE *>(GlobalLock(h))) {
+                image.assign(p, p + size);
                 GlobalUnlock(h);
             }
         }
     }
     CloseClipboard();
-    return AddEntry(std::move(text));
+
+    if (entry.kind == KIND_IMAGE) {
+        size_t pixelOffset = DibPixelOffset(image.data(), image.size());
+        if (!pixelOffset) {
+            Wipe(image);
+            return false;
+        }
+        auto *head = reinterpret_cast<const BITMAPINFOHEADER *>(image.data());
+        entry.pixels = {head->biWidth, std::abs(head->biHeight)};
+        std::vector<BYTE> thumb = MakeThumbnail(image, pixelOffset);
+        entry.thumb = Seal(thumb);
+        entry.tag = 2166136261u; // FNV-1a over every 251st byte
+        for (size_t i = 0; i < image.size(); i += 251) entry.tag = (entry.tag ^ image[i]) * 16777619u;
+        AddEntry(std::move(entry), image);
+        return true;
+    }
+
+    // Not something we keep: empty, blank, huge.
+    bool blank = std::all_of(text.begin(), text.end(), [](wchar_t c) { return c < 32 || iswspace(c); });
+    if (text.size() > kMaxEntryChars || blank) {
+        Wipe(text);
+        return false;
+    }
+    AddEntry(std::move(entry), text);
+    return true;
 }
 
-// Empty text clears the clipboard.
-bool SetClipboardText(const std::wstring &text) {
-    if (!OpenClipboardRetry()) return false;
-    bool ok = EmptyClipboard() != FALSE;
-    if (!text.empty()) {
-        ok = false;
-        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-            if (void *p = GlobalLock(mem)) {
-                memcpy(p, text.c_str(), bytes);
-                GlobalUnlock(mem);
-                ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+HGLOBAL MakeGlobal(const void *data, size_t bytes) {
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!mem) return nullptr;
+    void *p = GlobalLock(mem);
+    if (!p) {
+        GlobalFree(mem);
+        return nullptr;
+    }
+    memcpy(p, data, bytes);
+    GlobalUnlock(mem);
+    return mem;
+}
+
+// CF_HDROP content for the '\n'-separated paths that still exist; nullptr if none does.
+HGLOBAL MakeDropFiles(const std::wstring &paths) {
+    DROPFILES head{};
+    head.pFiles = sizeof(head);
+    head.fWide = TRUE;
+    std::vector<BYTE> drop(sizeof(head));
+    drop.reserve(sizeof(head) + (paths.size() + 2) * sizeof(wchar_t));
+    memcpy(drop.data(), &head, sizeof(head));
+
+    for (size_t start = 0; start < paths.size();) {
+        size_t end = std::min(paths.find(L'\n', start), paths.size());
+        std::wstring path = paths.substr(start, end - start);
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            auto *p = reinterpret_cast<const BYTE *>(path.c_str());
+            drop.insert(drop.end(), p, p + (path.size() + 1) * sizeof(wchar_t));
+        }
+        Wipe(path);
+        start = end + 1;
+    }
+    HGLOBAL mem = nullptr;
+    if (drop.size() > sizeof(head)) {
+        drop.insert(drop.end(), sizeof(wchar_t), 0); // the list ends with an empty string
+        mem = MakeGlobal(drop.data(), drop.size());
+    }
+    Wipe(drop);
+    return mem;
+}
+
+// Puts history entry idx on the clipboard and on top of the history; idx < 0 clears the clipboard.
+bool SetClipboard(int idx) {
+    static const UINT fmtDropEffect = RegisterClipboardFormatW(L"Preferred DropEffect");
+
+    UINT format = CF_UNICODETEXT;
+    HGLOBAL mem = nullptr;
+    if (idx >= 0) {
+        const Entry &e = g_history[idx];
+        if (e.kind == KIND_IMAGE) {
+            std::vector<BYTE> dib = Unseal<std::vector<BYTE>>(e.body);
+            format = CF_DIB;
+            if (!dib.empty()) mem = MakeGlobal(dib.data(), dib.size());
+            Wipe(dib);
+        } else {
+            std::wstring text = Unseal<std::wstring>(e.body);
+            if (e.kind == KIND_FILES) {
+                format = CF_HDROP;
+                mem = MakeDropFiles(text);
+            } else if (!text.empty()) {
+                mem = MakeGlobal(text.c_str(), (text.size() + 1) * sizeof(wchar_t));
             }
-            if (!ok) GlobalFree(mem);
+            Wipe(text);
+        }
+        if (!mem) return false; // e.g. the files are gone; the clipboard is left alone
+    }
+
+    if (!OpenClipboardRetry()) {
+        if (mem) GlobalFree(mem);
+        return false;
+    }
+    bool ok = EmptyClipboard() != FALSE;
+    if (mem) {
+        ok = SetClipboardData(format, mem) != nullptr;
+        if (!ok) GlobalFree(mem);
+        if (ok && format == CF_HDROP) {
+            DWORD effect = 1; // DROPEFFECT_COPY: pasting must never move the files
+            HGLOBAL effectMem = MakeGlobal(&effect, sizeof(effect));
+            if (effectMem && !SetClipboardData(fmtDropEffect, effectMem)) GlobalFree(effectMem);
         }
     }
     CloseClipboard();
+
+    // WM_CLIPBOARDUPDATE ignores our own changes, so the bookkeeping happens here.
+    g_passThrough = g_paused || idx < 0 || !ok;
+    if (ok && idx > 0) {
+        std::rotate(g_history.begin(), g_history.begin() + idx, g_history.begin() + idx + 1);
+        ScheduleSave();
+        if (IsWindowVisible(g_hwnd)) RefreshPopup();
+    }
     return ok;
 }
 
@@ -473,24 +762,23 @@ void Navigate(DWORD vk) {
 void PasteSelected() {
     int idx = SelectedEntry();
     if (idx < 0) return;
-    std::wstring text = g_history[idx]; // copy: the clipboard update reorders g_history
     bool paste = g_pasteOnSelect;
     HidePopup();
-    if (SetClipboardText(text) && paste) SendCtrlV();
+    if (SetClipboard(idx) && paste) SendCtrlV();
 }
 
 void DeleteEntry(int idx) {
     if (idx < 0 || static_cast<size_t>(idx) >= g_history.size()) return;
     g_history.erase(g_history.begin() + idx);
-    // The top entry is what the clipboard holds; keep the two in sync so a removed text is really gone.
-    if (idx == 0 && !g_passThrough) SetClipboardText(g_history.empty() ? L"" : g_history.front());
+    // The top entry is what the clipboard holds; keep the two in sync so a removed entry is really gone.
+    if (idx == 0 && !g_passThrough && (g_history.empty() || !SetClipboard(0))) SetClipboard(-1);
     ScheduleSave();
     RefreshPopup();
 }
 
 void ClearHistory() {
     g_history.clear();
-    if (!g_passThrough) SetClipboardText(L"");
+    if (!g_passThrough) SetClipboard(-1);
     SaveHistory();
     HidePopup();
 }
@@ -613,13 +901,72 @@ void DrawItem(const DRAWITEMSTRUCT *d) {
         FillRect(d->hDC, &line, dcBrush);
     }
 
-    std::wstring text = Preview(g_history[d->itemID]);
+    const Entry &e = g_history[d->itemID];
     RECT textRc = {rc.left + S(16), rc.top + S(8), rc.right - DeleteZoneWidth(), rc.bottom - S(8)};
     HGDIOBJ oldFont = SelectObject(d->hDC, g_font);
     SetBkMode(d->hDC, TRANSPARENT);
-    SetTextColor(d->hDC, g_theme.text);
-    DrawTextW(d->hDC, text.c_str(), static_cast<int>(text.size()), &textRc,
-              DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    // Main line in the text color, detail line below it in the dimmer one.
+    auto drawLines = [&](const std::wstring &main, const std::wstring &detail, UINT detailFlags) {
+        RECT line = textRc;
+        line.bottom = line.top + g_lineHeight;
+        SetTextColor(d->hDC, g_theme.text);
+        DrawTextW(d->hDC, main.c_str(), static_cast<int>(main.size()), &line,
+                  DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        OffsetRect(&line, 0, g_lineHeight);
+        SetTextColor(d->hDC, g_theme.sub);
+        DrawTextW(d->hDC, detail.c_str(), static_cast<int>(detail.size()), &line,
+                  DT_SINGLELINE | DT_NOPREFIX | detailFlags);
+    };
+
+    if (e.kind == KIND_IMAGE) {
+        std::vector<BYTE> thumb;
+        if (g_showThumbnails) thumb = Unseal<std::vector<BYTE>>(e.thumb);
+        if (thumb.size() > sizeof(BITMAPINFOHEADER)) {
+            auto *info = reinterpret_cast<const BITMAPINFO *>(thumb.data());
+            int tw = info->bmiHeader.biWidth, th = -info->bmiHeader.biHeight;
+            int boxW = S(140), boxH = textRc.bottom - textRc.top;
+            double scale = std::min({1.0, static_cast<double>(boxW) / tw, static_cast<double>(boxH) / th});
+            int w = std::max(1, static_cast<int>(tw * scale)), h = std::max(1, static_cast<int>(th * scale));
+            SetStretchBltMode(d->hDC, HALFTONE);
+            SetBrushOrgEx(d->hDC, 0, 0, nullptr);
+            StretchDIBits(d->hDC, textRc.left, textRc.top + (boxH - h) / 2, w, h, 0, 0, tw, th,
+                          thumb.data() + sizeof(BITMAPINFOHEADER), info, DIB_RGB_COLORS, SRCCOPY);
+            textRc.left += w + S(12);
+        }
+        Wipe(thumb);
+        std::wstring size = std::to_wstring(e.pixels.cx) + L" × " + std::to_wstring(e.pixels.cy);
+        drawLines(L"Image", size, DT_END_ELLIPSIS);
+    } else if (e.kind == KIND_FILES) {
+        std::wstring paths = Unseal<std::wstring>(e.body);
+        size_t count = 0;
+        std::wstring names, detail;
+        names.reserve(paths.size() + 2); // neither string reallocates, so Wipe covers every copy
+        detail.reserve(paths.size() + 32);
+        for (size_t start = 0; start < paths.size() && names.size() < 300; ++count) {
+            size_t end = std::min(paths.find(L'\n', start), paths.size());
+            size_t slash = paths.rfind(L'\\', end - 1);
+            size_t name = slash != std::wstring::npos && slash >= start && slash + 1 < end ? slash + 1 : start;
+            if (count == 0) detail.assign(paths, start, name > start ? name - 1 - start : 0);
+            else names += L", ";
+            names.append(paths, name, end - name);
+            start = end + 1;
+        }
+        count = static_cast<size_t>(std::count(paths.begin(), paths.end(), L'\n')) + 1;
+        detail.insert(0, count == 1 ? L"File · " : std::to_wstring(count) + L" files · ");
+        drawLines(names, detail, DT_PATH_ELLIPSIS);
+        Wipe(paths);
+        Wipe(names);
+        Wipe(detail);
+    } else {
+        std::wstring full = Unseal<std::wstring>(e.body);
+        std::wstring text = Preview(full);
+        Wipe(full);
+        SetTextColor(d->hDC, g_theme.text);
+        DrawTextW(d->hDC, text.c_str(), static_cast<int>(text.size()), &textRc,
+                  DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX);
+        Wipe(text);
+    }
     SelectObject(d->hDC, oldFont);
 }
 
@@ -740,6 +1087,17 @@ void SetAutostart(bool enable) {
     RegCloseKey(key);
 }
 
+bool LoadSetting(const wchar_t *name, bool fallback) {
+    DWORD value = fallback, size = sizeof(value);
+    RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return value != 0;
+}
+
+void SaveSetting(const wchar_t *name, bool on) {
+    DWORD value = on;
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_DWORD, &value, sizeof(value));
+}
+
 void ShowTrayMenu() {
     HidePopup();
     UINT grayIfEmpty = g_history.empty() ? MF_GRAYED : 0;
@@ -748,6 +1106,7 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, L"Pause (Ctrl+V pastes normally)");
     AppendMenuW(menu, MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
+    AppendMenuW(menu, MF_STRING | (g_showThumbnails ? MF_CHECKED : 0), IDM_THUMBNAILS, L"Show image thumbnails");
     AppendMenuW(menu, MF_STRING | grayIfEmpty, IDM_CLEAR, L"Clear history");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
@@ -778,6 +1137,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         ApplyTheme();
         ApplyDpi(96);
+        g_showThumbnails = LoadSetting(kThumbnailsValue, true);
         AddClipboardFormatListener(hwnd);
         g_passThrough = !CaptureClipboard();
         g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
@@ -793,7 +1153,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_CLIPBOARDUPDATE:
-        g_passThrough = g_paused || !CaptureClipboard();
+        // SetClipboard has already done the bookkeeping for our own changes; reading a large image
+        // back would only keep the clipboard locked while the target application tries to paste.
+        if (GetClipboardOwner() != g_hwnd) g_passThrough = g_paused || !CaptureClipboard();
         return 0;
 
     case WM_ACTION:
@@ -843,6 +1205,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_passThrough = g_paused || !CaptureClipboard();
             break;
         case IDM_AUTOSTART: SetAutostart(!IsAutostartEnabled()); break;
+        case IDM_THUMBNAILS:
+            g_showThumbnails = !g_showThumbnails;
+            SaveSetting(kThumbnailsValue, g_showThumbnails);
+            break;
         case IDM_CLEAR:
             if (MessageBoxW(nullptr, L"Delete all clipboard history entries?", kAppName,
                             MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES)
