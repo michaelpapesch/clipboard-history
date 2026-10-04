@@ -4,7 +4,7 @@ All notable changes to this project are listed here. The project follows
 [Semantic Versioning](https://semver.org/); see the *Versioning* section of the
 [README](README.md) for what the three numbers mean for this tool.
 
-## Unreleased
+## 1.1.2 - 2026-10-04
 
 ### Changed
 

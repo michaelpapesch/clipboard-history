@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.3)
 # The one place the version lives (semantic versioning, see README). Releases are tagged vX.Y.Z.
-project(clipboard_history VERSION 1.1.1)
+project(clipboard_history VERSION 1.1.2)
 
 set(CMAKE_CXX_STANDARD 20)
 
