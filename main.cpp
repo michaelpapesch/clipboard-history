@@ -75,6 +75,8 @@ int g_headerHeight, g_listHeight;
 RECT g_clearRect;                    // "Clear all" hit area, set while painting
 UINT g_taskbarCreated;
 DWORD g_shownTick;
+POINT g_lastMouse;                   // cursor position of the last mouse move over the list
+int g_mouseRow = -1;                 // row the cursor is in; hovering selects only on entering another
 bool g_swallowed[256];               // keys whose key-down the hook has eaten
 bool g_pasteOnSelect;                // false when opened from the tray: only copy
 bool g_passThrough = true;           // clipboard content is not the top history entry
@@ -270,6 +272,7 @@ void ScheduleSave() {
 
 void RefreshPopup();
 void HidePopup();
+int RowFromPoint(LPARAM lp);
 
 // Single-line-friendly version of an entry: whitespace runs collapsed, length capped.
 std::wstring Preview(const std::wstring &s) {
@@ -600,9 +603,9 @@ bool IsDarkMode() {
 
 void ApplyTheme() {
     bool dark = IsDarkMode();
-    g_theme = dark ? Theme{RGB(32, 32, 32), RGB(240, 240, 240), RGB(160, 160, 160), RGB(56, 56, 56),
+    g_theme = dark ? Theme{RGB(32, 32, 32), RGB(240, 240, 240), RGB(160, 160, 160), RGB(45, 81, 99),
                            RGB(64, 64, 64), RGB(76, 194, 255)}
-                   : Theme{RGB(249, 249, 249), RGB(26, 26, 26), RGB(96, 96, 96), RGB(230, 230, 230),
+                   : Theme{RGB(249, 249, 249), RGB(26, 26, 26), RGB(96, 96, 96), RGB(204, 223, 239),
                            RGB(222, 222, 222), RGB(0, 103, 192)};
     if (g_bgBrush) DeleteObject(g_bgBrush);
     g_bgBrush = CreateSolidBrush(g_theme.bg);
@@ -735,7 +738,12 @@ void ShowPopup(bool forPaste) {
     y = std::clamp(y, static_cast<int>(work.top), std::max<int>(work.top, work.bottom - h));
 
     g_shownTick = GetTickCount();
+    GetCursorPos(&g_lastMouse);
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // A cursor already resting on a row must not select it; only moving into another row does.
+    POINT pt = g_lastMouse;
+    ScreenToClient(g_list, &pt);
+    g_mouseRow = RowFromPoint(MAKELPARAM(pt.x, pt.y));
     if (!g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, g_inst, 0);
 }
 
@@ -853,10 +861,22 @@ int RowFromPoint(LPARAM lp) {
 LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEMOVE: {
+        // Windows also sends moves when the window appears under a resting cursor or the list scrolls.
+        POINT screen;
+        GetCursorPos(&screen);
+        if (screen.x == g_lastMouse.x && screen.y == g_lastMouse.y) return 0;
+        g_lastMouse = screen;
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tme);
         int row = RowFromPoint(lp);
+        if (row == g_mouseRow) return 0;
+        g_mouseRow = row;
         if (row >= 0 && row != SendMessageW(hwnd, LB_GETCURSEL, 0, 0)) SendMessageW(hwnd, LB_SETCURSEL, row, 0);
         return 0;
     }
+    case WM_MOUSELEAVE:
+        g_mouseRow = -1;
+        return 0;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         int row = RowFromPoint(lp);
@@ -884,7 +904,7 @@ void DrawItem(const DRAWITEMSTRUCT *d) {
     SetDCBrushColor(d->hDC, selected ? g_theme.selBg : g_theme.bg);
     FillRect(d->hDC, &rc, dcBrush);
     if (selected) {
-        RECT bar = {rc.left + S(4), rc.top + S(10), rc.left + S(7), rc.bottom - S(10)};
+        RECT bar = {rc.left, rc.top, rc.left + S(4), rc.bottom};
         SetDCBrushColor(d->hDC, g_theme.accent);
         FillRect(d->hDC, &bar, dcBrush);
 

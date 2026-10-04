@@ -4,6 +4,18 @@ All notable changes to this project are listed here. The project follows
 [Semantic Versioning](https://semver.org/); see the *Versioning* section of the
 [README](README.md) for what the three numbers mean for this tool.
 
+## Unreleased
+
+### Changed
+
+- The selected entry in the popup is easier to spot: accent-tinted background and a full-height
+  accent bar.
+
+### Fixed
+
+- Opening the popup with the mouse already over it no longer selects the entry under the cursor;
+  hovering selects an entry only when the mouse moves into it.
+
 ## 1.1.1 - 2026-09-21
 
 ### Added
